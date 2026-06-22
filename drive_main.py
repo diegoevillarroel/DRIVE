@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""
+DRIVE — AI SSD Guardian
+Main entry point. Starts the Flask web server.
+Usage:
+    python drive_main.py [--port 8765] [--host 127.0.0.1] [--no-browser]
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+import webbrowser
+import threading
+import time
+from pathlib import Path
+
+# Ensure project root is on path
+_file = Path(__file__).resolve()
+sys.path.insert(0, str(_file.parent))
+
+from app import create_app
+from config import Config
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("drive")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="DRIVE",
+        description="DRIVE — AI SSD Guardian. Protect your SSD from AI agent wear.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Open http://localhost:8765 in your browser after starting.",
+    )
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--data-dir", type=str, default=None)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    config = Config(data_dir=args.data_dir)
+    app = create_app(config)
+
+    print()
+    print("  ╔══════════════════════════════════════════╗")
+    print("  ║  ██████╗ ███████╗███████╗███╗   ███╗     ║")
+    print("  ║  ██╔══██╗██╔════╝██╔════╝████╗ ████║     ║")
+    print("  ║  ██████╔╝█████╗  ███████╗██╔████╔██║     ║")
+    print("  ║  ██╔═══╝ ██╔══╝  ╚════██║██║╚██╔╝██║     ║")
+    print("  ║  ██║     ███████╗███████║██║ ╚═╝ ██║     ║")
+    print("  ║  ╚═╝     ╚══════╝╚══════╝╚═╝     ╚═╝     ║")
+    print("  ╚══════════════════════════════════════════╝")
+    print()
+    print("  AI SSD Guardian — getdrive.io")
+    print()
+    print(f"  Server:  http://{args.host}:{args.port}")
+    print(f"  Data:    {config.data_dir}")
+    print()
+
+    if config.smartmontools_path:
+        print(f"  smartctl: {config.smartmontools_path}")
+    else:
+        print("  smartctl: not found (install smartmontools for full SSD health)")
+
+    print()
+    log.info("DRIVE started on http://%s:%d", args.host, args.port)
+
+    if not args.no_browser:
+        def open_browser():
+            time.sleep(1.2)
+            try:
+                webbrowser.open(f"http://localhost:{args.port}")
+            except Exception:
+                pass
+        threading.Thread(target=open_browser, daemon=True).start()
+
+    try:
+        app.run(
+            host=args.host,
+            port=args.port,
+            debug=args.debug,
+            threaded=True,
+            use_reloader=False,
+        )
+    except KeyboardInterrupt:
+        log.info("Shutting down...")
+        print("\n  DRIVE stopped.")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

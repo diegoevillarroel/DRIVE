@@ -1,0 +1,25 @@
+{
+  "build": {
+    "devtools": true,
+    "beforeDevCommand": "",
+    "beforeBuildCommand": ""
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "DRIVE — AI SSD Guardian",
+        "width": 800,
+        "height": 680,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "decorations": true,
+        "transparent": false
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "build": {
+    "datasources": [],
+    "tests": [],
+    "benchmarks": []
+  },
+  "discovery": {
+    "tests": []
+  }
+}
