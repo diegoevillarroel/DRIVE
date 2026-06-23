@@ -73,26 +73,23 @@ def main() -> None:
     app = create_app(config)
 
     # ─── Banner ──────────────────────────────────────────────────────
-    print()
-    print("  ╔══════════════════════════════════════════╗")
-    print("  ║  ██████╗ ███████╗███████╗███╗   ███╗     ║")
-    print("  ║  ██╔══██╗██╔════╝██╔════╝████╗ ████║     ║")
-    print("  ║  ██████╔╝█████╗  ███████╗██╔████╔██║     ║")
-    print("  ║  ██╔═══╝ ██╔══╝  ╚════██║██║╚██╔╝██║     ║")
-    print("  ║  ██║     ███████╗███████║██║ ╚═╝ ██║     ║")
-    print("  ║  ╚═╝     ╚══════╝╚══════╝╚═╝     ╚═╝     ║")
-    print("  ╚══════════════════════════════════════════╝")
-    print()
-    print("  AI SSD Guardian — getdrive.io")
-    print()
-    print(f"  Server:  http://{args.host}:{args.port}")
-    print(f"  Data:    {config.data_dir}")
-    print()
+    banner = """
+  ========================================
+  ::  D R I V E  ::  A I   S S D   G U A R D I A N
+  ========================================
+
+  Server:  http://{host}:{port}
+  Data:    {data}
+"""
+    try:
+        print(banner.format(host=args.host, port=args.port, data=config.data_dir))
+    except UnicodeEncodeError:
+        print(banner.encode("ascii", "replace").decode().format(host=args.host, port=args.port, data=config.data_dir))
 
     if config.smartmontools_path:
         print(f"  smartctl: {config.smartmontools_path}")
     else:
-        print("  smartctl: not found (install smartmontools for SSD health)")
+        print("  smartctl: not found (install smartmontools for full SSD health)")
 
     print()
 
