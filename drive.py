@@ -19,7 +19,7 @@ from pathlib import Path
 _file = Path(__file__).resolve()
 sys.path.insert(0, str(_file.parent))
 
-from drive import create_app
+from app import create_app
 from config import Config
 
 logging.basicConfig(
