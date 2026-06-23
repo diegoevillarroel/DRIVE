@@ -5,7 +5,7 @@ Data models for type safety and serialization.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from typing import Optional, List
+from typing import Optional, List, TYPE_CHECKING
 
 
 @dataclass
@@ -161,3 +161,8 @@ class ScanResult:
             "scan_duration_ms": self.scan_duration_ms,
             "projected_life_months": self.projected_life_months,
         }
+
+
+class AppState(dict):
+    """In-memory app state shared across requests. Keys: shield_active, last_scan, last_scan_time, ramdisk_letter."""
+    pass
