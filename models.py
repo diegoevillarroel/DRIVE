@@ -8,6 +8,11 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional, List
 
 
+class AppState(dict):
+    """In-memory app state shared across requests. Keys: shield_active, last_scan, last_scan_time, ramdisk_letter."""
+    pass
+
+
 @dataclass
 class DriveInfo:
     """SSD/HDD health information from SMART data."""
