@@ -124,9 +124,16 @@ def build_share_card_png(scan: Dict[str, Any], shield: Optional[Any]) -> bytes:
     try:
         from PIL import Image, ImageDraw, ImageFont
     except Exception as e:
-        # Pillow missing in this environment — return the SVG with PNG extension so the
-        # user still gets the share asset. UI labels it as SVG when content-type is image/xml.
-        return build_share_card_svg(scan, shield).encode()
+        # Pillow missing — return a minimal valid 1x1 dark PNG so the download
+        # doesn't produce a broken/corrupt image file. User gets a placeholder.
+        # Proper PNG: IHDR (13 bytes) + IDAT (minimal) + IEND
+        # Minimal 1x1 black PNG:
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
+            b"\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0\x00\x00\x00\x03\x00\x01\x00\x05\xfe\xd4"
+            b"\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
 
     W, H = 1200, 630
     img = Image.new("RGB", (W, H), (10, 10, 11))

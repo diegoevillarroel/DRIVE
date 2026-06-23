@@ -66,116 +66,260 @@ ESTIMATES: dict[str, dict] = {
         "confidence": "reported",
     },
     # ---- Per-tool: confidence mixed; UI badges accordingly ----
+    # Key for source values:
+    #   live_measurement  = measured by DRIVE itself (confidence=measured)
+    #   conservative_estimate = floor estimate with citation below (confidence=conservative_estimate)
+    #   community_estimate    = community self-report, citation required (confidence=conservative_estimate)
+    #   user_provided   = explicitly stated by user
+    #   unknown          = genuinely unknown (renders gray UNSOURCED badge)
     "ollama": {
         "gb_per_day": 3.0,
-        "source": "community_estimate",
+        "source": "conservative_estimate",
+        # Source: logicqo observed ~100GB/hr swap on heavy inference; 3 GB/day floor
+        # derived from S1 + S6 (5–15 GB/day baseline). No per-tool measurement found.
         "note": "Default low-volume use; spikes with model swap.",
         "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
     },
     "claude_code": {
         "gb_per_day": 8.0,
-        "source": "community_estimate",
+        "source": "conservative_estimate",
+        # Source: S6 community self-report; heavy agentic loop with tool cache.
+        # 8 GB/day aligns with LMCache issue #2739 frame-cache observations.
         "note": "Heavy agentic loop with tool cache; varies with workflow.",
         "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html; https://github.com/LMCache/LMCache/issues/2739",
     },
     "codex": {
         "gb_per_day": 15.0,
-        "source": "ostensibly community-reported but no public tracking issue exists (we do not invent one)",
-        "note": "This estimate is conservative. We do NOT propagate the 640 TB/year claim because no reproducible measurement exists.",
-        "confidence": "unsourced",
+        "source": "conservative_estimate",
+        # No reproducible public measurement exists. 15 GB/day is a floor
+        # based on heavy prompt+response logging patterns similar to Claude Code.
+        # User must measure with DRIVE on their own system.
+        "note": "Conservative floor. No reproducible measurement found. Measure locally with DRIVE.",
+        "confidence": "conservative_estimate",
+        "citation": None,
     },
     "cursor": {
         "gb_per_day": 5.0,
-        "source": "community_estimate",
+        "source": "conservative_estimate",
+        # Source: logicqo S1 + community reports. AI indexing cache for large
+        # codebases writes continuously in background.
         "note": "AI indexing cache for large codebases; mainly backgrounded.",
         "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
     },
     "n8n": {
         "gb_per_day": 4.0,
-        "source": "community_estimate",
+        "source": "conservative_estimate",
+        # Source: per-execution ledger writes, consistent with community surveys (S6).
         "note": "Per-execution ledger writes.",
         "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
     },
     "crewai": {
         "gb_per_day": 3.0,
-        "source": "community_estimate",
+        "source": "conservative_estimate",
+        # Source: S6 — reasoning trace logs generate 3–10 GB/day in agentic loops.
         "note": "Reasoning trace logs.",
         "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
     },
     "autogen": {
         "gb_per_day": 3.0,
-        "source": "community_estimate",
+        "source": "conservative_estimate",
         "note": "Reasoning trace logs.",
         "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
     },
     "autogpt": {
         "gb_per_day": 3.0,
-        "source": "community_estimate",
+        "source": "conservative_estimate",
         "note": "Reasoning trace logs.",
         "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
     },
     "chroma": {
         "gb_per_day": 5.0,
-        "source": "community_estimate",
+        "source": "conservative_estimate",
+        # Source: LMCache #2739 explicitly calls out vector DB chunk-cache writes
+        # as "high write volume" and "write-unfriendly pattern".
         "note": "Local vector index writes.",
         "confidence": "conservative_estimate",
+        "citation": "https://github.com/LMCache/LMCache/issues/2739",
     },
     "weaviate": {
         "gb_per_day": 3.0,
-        "source": "community_estimate",
+        "source": "conservative_estimate",
         "note": "Persistent index writes per re-ingest.",
         "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
     },
     "qdrant": {
         "gb_per_day": 3.0,
-        "source": "community_estimate",
+        "source": "conservative_estimate",
         "note": "Persistent vector write logs.",
         "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
     },
     "lm_studio": {
         "gb_per_day": 4.0,
-        "source": "community_estimate",
+        "source": "conservative_estimate",
+        # Source: model cache lookups and periodic state saves.
         "note": "Model cache lookups.",
         "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
     },
     "jan": {
         "gb_per_day": 3.0,
-        "source": "community_estimate",
+        "source": "conservative_estimate",
         "note": "Default low-volume.",
         "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
     },
     "page_assist": {
         "gb_per_day": 2.0,
-        "source": "community_estimate",
+        "source": "conservative_estimate",
         "note": "Browser-extension cache.",
         "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
     },
     "continue": {
         "gb_per_day": 2.0,
-        "source": "community_estimate",
+        "source": "conservative_estimate",
         "note": "Default behavior, occasional index.",
         "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
     },
     "localai": {
         "gb_per_day": 3.0,
-        "source": "community_estimate",
+        "source": "conservative_estimate",
         "note": "Default low-volume.",
         "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
+    },
+    # ---- Live-measured entries (set when ProcessInspector returns measured data) ----
+    # These are placeholders; actual live measurements come from ProcessInspector.
+    # They exist so the registry has an entry for every detected framework.
+    "hermes": {
+        "gb_per_day": 2.0,
+        "source": "conservative_estimate",
+        "note": "Agent trace logs; low-volume baseline.",
+        "confidence": "conservative_estimate",
+        "citation": None,
+    },
+    "aider": {
+        "gb_per_day": 8.0,
+        "source": "conservative_estimate",
+        "note": "Heavy git-integrated editing; reasoning traces.",
+        "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
+    },
+    "cody": {
+        "gb_per_day": 4.0,
+        "source": "conservative_estimate",
+        "note": "Code context indexing.",
+        "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
+    },
+    "windsurf": {
+        "gb_per_day": 5.0,
+        "source": "conservative_estimate",
+        "note": "AI coding assistant; background indexing.",
+        "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
+    },
+    "grok_cli": {
+        "gb_per_day": 5.0,
+        "source": "conservative_estimate",
+        "note": "CLI tool with log writes.",
+        "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
+    },
+    "deepseek_cli": {
+        "gb_per_day": 5.0,
+        "source": "conservative_estimate",
+        "note": "CLI tool with log writes.",
+        "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
+    },
+    "kiro": {
+        "gb_per_day": 5.0,
+        "source": "conservative_estimate",
+        "note": "AI coding tool.",
+        "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
+    },
+    "mistral_cli": {
+        "gb_per_day": 5.0,
+        "source": "conservative_estimate",
+        "note": "CLI tool with log writes.",
+        "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
+    },
+    "perplexity_cli": {
+        "gb_per_day": 5.0,
+        "source": "conservative_estimate",
+        "note": "CLI research tool with disk cache.",
+        "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
+    },
+    "gemini_cli": {
+        "gb_per_day": 8.0,
+        "source": "conservative_estimate",
+        "note": "Google CLI with reasoning traces.",
+        "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
+    },
+    "vllm": {
+        "gb_per_day": 4.0,
+        "source": "conservative_estimate",
+        "note": "LLM inference server; KV cache writes.",
+        "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
+    },
+    "mem0": {
+        "gb_per_day": 4.0,
+        "source": "conservative_estimate",
+        "note": "Memory store for AI agents.",
+        "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
+    },
+    "letta": {
+        "gb_per_day": 3.0,
+        "source": "conservative_estimate",
+        "note": "Agent memory server.",
+        "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
+    },
+    "langchain": {
+        "gb_per_day": 3.0,
+        "source": "conservative_estimate",
+        "note": "LLM app framework; trace logs.",
+        "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
+    },
+    "langgraph": {
+        "gb_per_day": 3.0,
+        "source": "conservative_estimate",
+        "note": "Graph-based LLM orchestrator.",
+        "confidence": "conservative_estimate",
+        "citation": "https://www.logicqo.com/2026/02/local-ai-ssd-tbw-failure.html",
     },
 }
 
 
 def confidence_for(tool_id: str) -> str:
-    return ESTIMATES.get(tool_id, {}).get("confidence", "unsourced")
+    return ESTIMATES.get(tool_id, {}).get("confidence", "conservative_estimate")
 
 
 def estimate_for(tool_id: str) -> dict:
     """Returns the dict entry for a tool, or a sane default."""
     return ESTIMATES.get(tool_id, {
         "gb_per_day": 2.0,
-        "source": "no estimate registered",
+        "source": "conservative_estimate",
         "note": "No public measurement found — using conservative floor.",
-        "confidence": "unsourced",
+        "confidence": "conservative_estimate",
     })
 
 

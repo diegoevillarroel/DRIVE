@@ -79,7 +79,14 @@ class Config:
 
     @property
     def smartmontools_path(self) -> Optional[str]:
-        return self._config.get("smartmontools_path")
+        p = self._config.get("smartmontools_path")
+        if p:
+            return p
+        # Check bundled binary first
+        bundled = Path(__file__).parent / "bin" / "smartctl.exe"
+        if bundled.exists():
+            return str(bundled)
+        return None
 
     @property
     def ramdisk_size_gb(self) -> int:

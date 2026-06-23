@@ -1,14 +1,6 @@
 """
 DRIVE v1.2.0 — AI SSD Guardian
 Flask application factory + web routes + embedded UI.
-
-Phase 1 fixes:
-  - process_inspector replaces PathScanner for real process detection
-  - Background thread for framework sampling (no more blocking /api/scan)
-  - Shield status driven by ShieldManager.get_status() (honest, OS-verified)
-  - License endpoints wired for Gumroad
-  - Admin elevation endpoint
-  - Share panel endpoints
 """
 from __future__ import annotations
 
@@ -19,11 +11,10 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from flask import Flask, jsonify, request, Response
 
-# Import the HONEST ShieldStatus from shield_manager (not the stub in models.py)
 from shield_manager import ShieldManager, ShieldStatus as ShieldStatusReal
 from smart_reader import SmartReader
 from process_inspector import (
@@ -43,11 +34,10 @@ log = logging.getLogger("drive.app")
 
 
 # ─── Background Framework Sampler ────────────────────────────────────────────
-# Avoids blocking /api/scan with time.sleep() + rglob.
-# Runs sampling in a daemon thread; last result cached in memory.
 
 class BackgroundSampler:
-    """Periodically samples framework write rates in a background thread."""
+    """Periodically samples framework write rates in a background thread.
+    Avoids blocking /api/scan with time.sleep() + rglob."""
 
     def __init__(self, interval_sec: float = 30.0, sample_seconds: float = 5.0):
         self.interval_sec = interval_sec
@@ -93,16 +83,14 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
     app.config["DRIVE_CONFIG"] = config
 
-    # ─── Initialize components ──────────────────────────────────────
+    # ─── Components ─────────────────────────────────────────────────
     smart_reader = SmartReader(config.smartmontools_path)
     shield_manager = ShieldManager()
     license_manager = LicenseManager()
 
-    # Background sampler for non-blocking framework write rates
     sampler = BackgroundSampler(interval_sec=30.0, sample_seconds=5.0)
     sampler.start()
 
-    # In-memory state
     state: AppState = {
         "shield_active": shield_manager.get_status().active,
         "last_scan": None,
@@ -110,7 +98,7 @@ def create_app(config: Optional[Config] = None) -> Flask:
         "ramdisk_letter": shield_manager.get_status().ramdisk_letter,
     }
 
-    # ─── API Routes ──────────────────────────────────────────────────
+    # ─── Routes ──────────────────────────────────────────────────────
 
     @app.route("/api/health")
     def health():
@@ -126,43 +114,43 @@ def create_app(config: Optional[Config] = None) -> Flask:
         start = time.time()
         sample_seconds = float(request.args.get("sample_seconds", 0))
 
-        # 1. Read SMART data (quick, subprocess to smartctl)
+        # 1. Read SMART data
         drive_info = smart_reader.get_drive_info()
 
-        # 2. Detect running AI processes (PowerShell, ~5s max)
+        # 2. Detect running AI processes (PowerShell, ~0.5s)
         detected_procs = detect_ai_processes(timeout_sec=10)
 
-        # 3. Measure on-disk framework usage (fast — no rglob on huge dirs)
-                disk_usage = measure_framework_disk_usage()
+        # 3. Measure on-disk framework usage (fast — depth-limited)
+        disk_usage = measure_framework_disk_usage()
 
-                # 4. Get background-sampled write rates (non-blocking)
-                bg_writes = sampler.get_latest()
+        # 4. Background-sampled write rates (cached, non-blocking)
+        bg_writes = sampler.get_latest()
 
-                # If caller asked for a live sample, run it in a thread (cap 2s to stay responsive)
-                live_writes: Dict[str, float] = {}
-                if sample_seconds > 0:
-                    sample_seconds = min(sample_seconds, 2.0)
-                    result_holder: list = [{}]
+        # 5. Live sample: run in thread, cap at 2s so /api/scan stays responsive
+        live_writes: Dict[str, float] = {}
+        if sample_seconds > 0:
+            sample_seconds = min(sample_seconds, 2.0)
+            result_holder: List[Dict[str, float]] = [{}]
 
-                    def _bg_sample():
-                        try:
-                            result_holder[0] = sample_framework_writes(seconds=sample_seconds)
-                        except Exception as e:
-                            log.warning("Live sample failed (non-fatal): %s", e)
+            def _bg_sample() -> None:
+                try:
+                    result_holder[0] = sample_framework_writes(seconds=sample_seconds)
+                except Exception as e:
+                    log.warning("Live sample failed: %s", e)
 
-                    t = threading.Thread(target=_bg_sample)
-                    t.start()
-                    t.join(timeout=sample_seconds + 2)
-                    live_writes = result_holder[0]
+            t = threading.Thread(target=_bg_sample)
+            t.start()
+            t.join(timeout=sample_seconds + 2)
+            live_writes = result_holder[0]
 
-        # 5. Build framework info list — merge detected processes + estimates
-        framework_infos = []
-        seen_ids = set()
+        # 6. Build framework info list
+        framework_infos: List[Dict[str, Any]] = []
+        seen_ids: set = set()
         total_daily_gb = 0.0
 
+        # Process-detected frameworks
         for proc in detected_procs:
             tool_id = proc.name.lower().replace(" ", "_").replace("(", "").replace(")", "")
-            # Normalize common names to registry keys
             id_map = {
                 "ollama_server": "ollama",
                 "ollama": "ollama",
@@ -178,75 +166,70 @@ def create_app(config: Optional[Config] = None) -> Flask:
                 "autogen_(microsoft)": "autogen",
                 "autogpt": "autogpt",
                 "hermes_agent_(nous)": "hermes",
+                "node.js": "nodejs",
             }
             reg_id = id_map.get(tool_id, tool_id)
             est = estimate_for(reg_id)
-            confidence = confidence_for(reg_id)
-
+            conf = confidence_for(reg_id)
             # Use live-measured rate if available, else background, else estimate
-            measured_rate = live_writes.get(proc.label) or bg_writes.get(proc.label)
-            if measured_rate and measured_rate > 0:
-                daily_gb = round(measured_rate * 86400 / (1024**3), 2)
-                source = "live_sample"
-                confidence = "measured"
-            else:
-                daily_gb = est["gb_per_day"]
-                source = est["source"]
+                        measured_rate = live_writes.get(proc.label) or bg_writes.get(proc.label)
+                        if measured_rate and measured_rate > 0:
+                            daily_gb = round(measured_rate * 86400 / (1024**3), 2)
+                            source = "live_measurement"
+                            confidence = "measured"
+                        else:
+                            daily_gb = est["gb_per_day"]
+                            source = est["source"]
 
             severity = "high" if daily_gb >= 10 else "medium" if daily_gb >= 2 else "low"
-
-            fw_info = {
-                "id": reg_id,
-                "name": proc.label,
-                "pid": proc.pid,
-                "estimated_daily_gb": daily_gb,
-                "severity": severity,
-                "confidence": confidence,
-                "source": source,
-                "measured_bytes_per_sec": measured_rate if measured_rate else None,
-                "on_disk_size_bytes": proc.on_disk_size_bytes,
-            }
             key = (reg_id, proc.label)
             if key not in seen_ids:
                 seen_ids.add(key)
-                framework_infos.append(fw_info)
+                framework_infos.append({
+                    "id": reg_id,
+                    "name": proc.label,
+                    "pid": proc.pid,
+                    "estimated_daily_gb": daily_gb,
+                    "severity": severity,
+                    "confidence": conf,
+                    "source": source,
+                    "measured_bytes_per_sec": measured_rate if measured_rate else None,
+                    "on_disk_size_bytes": proc.on_disk_size_bytes,
+                })
                 total_daily_gb += daily_gb
 
-        # 6. Also add frameworks from disk_usage that weren't detected as running
+        # Disk-usage-detected frameworks (not running)
+        label_map = {
+            "Ollama models": "ollama",
+            "Claude Code projects": "claude_code",
+            "Cursor storage": "cursor",
+            "n8n logs & DB": "n8n",
+            "ChromaDB persist": "chroma",
+            "Hermes Agent": "hermes",
+            "LM Studio cache": "lm_studio",
+        }
         for label, size_bytes in disk_usage.items():
             if any(label in f["name"] for f in framework_infos):
                 continue
-            # Normalize label to registry key
-            label_map = {
-                "Ollama models": "ollama",
-                "Claude Code projects": "claude_code",
-                "Cursor storage": "cursor",
-                "n8n logs & DB": "n8n",
-                "ChromaDB persist": "chroma",
-                "Hermes Agent": "hermes",
-                "LM Studio cache": "lm_studio",
-            }
             reg_id = label_map.get(label, label.lower().replace(" ", "_"))
             est = estimate_for(reg_id)
-            confidence = confidence_for(reg_id)
+            conf = confidence_for(reg_id)
             daily_gb = est["gb_per_day"]
             severity = "high" if daily_gb >= 10 else "medium" if daily_gb >= 2 else "low"
-
-            fw_info = {
+            framework_infos.append({
                 "id": reg_id,
                 "name": label,
                 "pid": 0,
                 "estimated_daily_gb": daily_gb,
                 "severity": severity,
-                "confidence": confidence,
-                "source": est["source"],
+                "confidence": conf,
+                "source": est.get("source", "unknown"),
                 "measured_bytes_per_sec": None,
                 "on_disk_size_bytes": size_bytes,
-            }
-            framework_infos.append(fw_info)
+            })
             total_daily_gb += daily_gb
 
-        # 7. Calculate projected drive life
+        # 7. Projected drive life
         if drive_info.tbw_written_tb and total_daily_gb > 0:
             drive_info.projected_life_months = drive_info.estimate_life_months(total_daily_gb)
 
@@ -265,33 +248,28 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
     @app.route("/api/drive", methods=["GET"])
     def drive_info():
-        """Get SSD health info only."""
         info = smart_reader.get_drive_info()
         return jsonify(info.to_dict())
 
     @app.route("/api/frameworks", methods=["GET"])
     def frameworks():
-        """Detect active AI frameworks only."""
         procs = detect_ai_processes(timeout_sec=10)
         return jsonify([p.to_dict() for p in procs])
 
-    # ─── Shield Routes (honest, OS-verified) ───────────────────────
+    # ─── Shield ─────────────────────────────────────────────────────
 
     @app.route("/api/shield/status", methods=["GET"])
     def shield_status():
-        """Get current shield status — ALWAYS re-verified against OS."""
         status = shield_manager.get_status()
         state["shield_active"] = status.active
         return jsonify(status.to_dict())
 
     @app.route("/api/shield/activate", methods=["POST"])
     def shield_activate():
-        """Activate SSD protection shield. Requires license."""
         data = request.get_json() or {}
         ramdisk_size_gb = data.get("ramdisk_size_gb", 4)
         license_key = data.get("license_key")
 
-        # Verify license
         license_verified = False
         if license_key:
             lr = license_manager.activate(license_key)
@@ -321,29 +299,25 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
     @app.route("/api/shield/deactivate", methods=["POST"])
     def shield_deactivate():
-        """Deactivate shield and restore original paths."""
         result = shield_manager.deactivate_shield()
         state["shield_active"] = False
         return jsonify(result)
 
     @app.route("/api/shield/benchmark", methods=["POST"])
     def shield_benchmark():
-        """Run write benchmark."""
         data = request.get_json() or {}
         duration_sec = data.get("duration_sec", 10)
         result = shield_manager.run_benchmark(duration_sec=duration_sec)
         return jsonify(result)
 
-    # ─── License Routes ─────────────────────────────────────────────
+    # ─── License ────────────────────────────────────────────────────
 
     @app.route("/api/license/status", methods=["GET"])
     def license_status():
-        """Get current license status."""
         return jsonify(license_manager.get_status())
 
     @app.route("/api/license/activate", methods=["POST"])
     def license_activate():
-        """Activate a license key."""
         data = request.get_json() or {}
         key = data.get("license_key", "").strip()
         if not key:
@@ -354,25 +328,22 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
     @app.route("/api/license/deactivate", methods=["POST"])
     def license_deactivate():
-        """Remove stored license."""
         ok = license_manager.deactivate()
         return jsonify({"success": ok})
 
-    # ─── Admin Elevation ────────────────────────────────────────────
+    # ─── Admin Elevation ─────────────────────────────────────────────
 
     @app.route("/api/admin/elevate", methods=["POST"])
     def admin_elevate():
-        """Re-launch DRIVE with UAC admin elevation."""
         pid = shield_manager.request_elevation_and_restart()
         if pid > 0:
             return jsonify({"success": True, "message": "Elevating. New instance will start with admin."})
         return jsonify({"success": False, "error": "Elevation failed or cancelled by user."}), 500
 
-    # ─── Share Routes ──────────────────────────────────────────────
+    # ─── Share ───────────────────────────────────────────────────────
 
     @app.route("/api/share/text", methods=["GET"])
     def share_text():
-        """Get compact text report for sharing."""
         scan = state["last_scan"]
         if scan is None:
             return jsonify({"text": "Run a scan first."})
@@ -382,7 +353,6 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
     @app.route("/api/share/card.svg", methods=["GET"])
     def share_card_svg():
-        """SVG share card."""
         scan = state["last_scan"]
         if scan is None:
             return Response("<svg></svg>", mimetype="image/svg+xml")
@@ -392,7 +362,6 @@ def create_app(config: Optional[Config] = None) -> Flask:
 
     @app.route("/api/share/card.png", methods=["GET"])
     def share_card_png():
-        """PNG share card (1200x630)."""
         scan = state["last_scan"]
         if scan is None:
             return Response(b"", mimetype="image/png")
@@ -400,7 +369,7 @@ def create_app(config: Optional[Config] = None) -> Flask:
         png_bytes = build_share_card_png(scan.to_dict(), shield)
         return Response(png_bytes, mimetype="image/png")
 
-    # ─── Config Route ──────────────────────────────────────────────
+    # ─── Config ──────────────────────────────────────────────────────
 
     @app.route("/api/config", methods=["GET"])
     def get_config():
@@ -410,7 +379,7 @@ def create_app(config: Optional[Config] = None) -> Flask:
             "version": "1.2.0",
         })
 
-    # ─── Web UI ────────────────────────────────────────────────────
+    # ─── Web UI ──────────────────────────────────────────────────────
 
     @app.route("/")
     def index():
@@ -419,5 +388,5 @@ def create_app(config: Optional[Config] = None) -> Flask:
     return app
 
 
-# ─── Embedded Web UI ──────────────────────────────────────────────────────────
+# ─── Embedded Web UI ────────────────────────────────────────────────────────
 from v2_ui import render_ui
