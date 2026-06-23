@@ -6,7 +6,8 @@ Imports are intentionally minimal here (models only) to allow
 unit tests to import the package without requiring Flask.
 For the Flask app, import from app.py instead.
 """
-from models import DriveInfo, FrameworkInfo, ShieldStatus, ScanResult
+from models import DriveInfo, FrameworkInfo, ScanResult
+from shield_manager import ShieldStatus
 
-__all__ = ["DriveInfo", "FrameworkInfo", "ShieldStatus", "ScanResult"]
-__version__ = "1.0.0"
+__all__ = ["DriveInfo", "FrameworkInfo", "ScanResult", "ShieldStatus"]
+__version__ = "1.2.0"

@@ -1,259 +1,423 @@
 """
-DRIVE — AI SSD Guardian
-Flask application factory.
-Flask import is deferred to runtime (lazy import).
-This avoids breaking tests that only need models/config/path_scanner.
+DRIVE v1.2.0 — AI SSD Guardian
+Flask application factory + web routes + embedded UI.
+
+Phase 1 fixes:
+  - process_inspector replaces PathScanner for real process detection
+  - Background thread for framework sampling (no more blocking /api/scan)
+  - Shield status driven by ShieldManager.get_status() (honest, OS-verified)
+  - License endpoints wired for Gumroad
+  - Admin elevation endpoint
+  - Share panel endpoints
 """
 from __future__ import annotations
 
 import logging
 import platform
+import subprocess
+import sys
+import threading
 import time
-from typing import Optional
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from flask import Flask, jsonify, request, Response
+
+# Import the HONEST ShieldStatus from shield_manager (not the stub in models.py)
+from shield_manager import ShieldManager, ShieldStatus as ShieldStatusReal
+from smart_reader import SmartReader
+from process_inspector import (
+    detect_ai_processes,
+    measure_framework_disk_usage,
+    sample_framework_writes,
+    sample_disk_writes,
+    DiskSample,
+)
+from estimate_registry import estimate_for, confidence_for
+from license_manager import LicenseManager
+from share_panel import build_share_report, build_share_card_svg, build_share_card_png
+from config import Config
+from models import DriveInfo, ScanResult, AppState
 
 log = logging.getLogger("drive.app")
 
 
-def create_app(config=None):
-    """
-    Create and configure the Flask application.
-    Flask is imported lazily to avoid ImportError in test environments.
-    """
-    from flask import Flask, jsonify, request
+# ─── Background Framework Sampler ────────────────────────────────────────────
+# Avoids blocking /api/scan with time.sleep() + rglob.
+# Runs sampling in a daemon thread; last result cached in memory.
 
-    from models import DriveInfo, ScanResult
-    from smart_reader import SmartReader
-    from path_scanner import PathScanner
-    from shield_manager import ShieldManager
-    from web_ui import render_ui
+class BackgroundSampler:
+    """Periodically samples framework write rates in a background thread."""
 
+    def __init__(self, interval_sec: float = 30.0, sample_seconds: float = 5.0):
+        self.interval_sec = interval_sec
+        self.sample_seconds = sample_seconds
+        self._last_result: Dict[str, Any] = {}
+        self._last_time: float = 0.0
+        self._lock = threading.Lock()
+        self._running = False
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        t = threading.Thread(target=self._loop, daemon=True)
+        t.start()
+        log.info("BackgroundSampler started (interval=%ss, sample=%ss)",
+                 self.interval_sec, self.sample_seconds)
+
+    def _loop(self) -> None:
+        while self._running:
+            try:
+                result = sample_framework_writes(seconds=self.sample_seconds)
+                with self._lock:
+                    self._last_result = result
+                    self._last_time = time.time()
+            except Exception as e:
+                log.error("BackgroundSampler error: %s", e)
+            time.sleep(self.interval_sec)
+
+    def get_latest(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._last_result)
+
+    def stop(self) -> None:
+        self._running = False
+
+
+def create_app(config: Optional[Config] = None) -> Flask:
     app = Flask(__name__)
 
     if config is None:
-        from config import Config
         config = Config()
 
     app.config["DRIVE_CONFIG"] = config
 
-    # Initialize components
+    # ─── Initialize components ──────────────────────────────────────
     smart_reader = SmartReader(config.smartmontools_path)
-    process_inspector = None  # imported lazily
-    shield_manager = ShieldManager(data_dir=config.data_dir)
+    shield_manager = ShieldManager()
+    license_manager = LicenseManager()
 
-    # Application state
-    state = {
-        "shield_active": False,
+    # Background sampler for non-blocking framework write rates
+    sampler = BackgroundSampler(interval_sec=30.0, sample_seconds=5.0)
+    sampler.start()
+
+    # In-memory state
+    state: AppState = {
+        "shield_active": shield_manager.get_status().active,
         "last_scan": None,
+        "last_scan_time": None,
+        "ramdisk_letter": shield_manager.get_status().ramdisk_letter,
     }
 
-    # ─── Health ────────────────────────────────────────────────────────
+    # ─── API Routes ──────────────────────────────────────────────────
 
     @app.route("/api/health")
     def health():
         return jsonify({
             "status": "ok",
-            "version": "1.1.0",
-            "shield_active": state["shield_active"],
+            "version": "1.2.0",
             "platform": platform.system(),
         })
 
-    # ─── SSD Scan ─────────────────────────────────────────────────────
-
     @app.route("/api/scan", methods=["GET"])
     def scan():
-        """Run full SSD health + AI impact scan.
-
-        Combines:
-        - SMART data via smartctl (if installed) or WMI fallback
-        - Real running process detection
-        - 5-second observed writes sample to known framework dirs
-        """
+        """Run full SSD + AI impact scan. Non-blocking via cached background samples."""
         start = time.time()
+        sample_seconds = float(request.args.get("sample_seconds", 0))
 
-        # Smart data
-        try:
-            drive_info = smart_reader.get_drive_info()
-        except Exception as e:
-            log.error("SMART read failed: %s", e)
-            drive_info = DriveInfo(model="Unknown")
+        # 1. Read SMART data (quick, subprocess to smartctl)
+        drive_info = smart_reader.get_drive_info()
 
-        # Lazy import process_inspector (so we surface a cleaner traceback)
-        from process_inspector import (
-            detect_ai_processes,
-            measure_framework_disk_usage,
-            sample_framework_writes,
-            DetectedProcess,
-        )
-        sample_seconds = float(request.args.get("sample_seconds", 5.0))
-        sample_seconds = max(2.0, min(sample_seconds, 30.0))
-        log.info("Running %ss sample to measure real writes", sample_seconds)
+        # 2. Detect running AI processes (PowerShell, ~5s max)
+        detected_procs = detect_ai_processes(timeout_sec=10)
 
-        # Detect running AI processes
-        ai_processes = detect_ai_processes()
-        for p in ai_processes:
-            p.to_dict = lambda _self=p: _self.__dict__  # convenience, then overwritten below
+        # 3. Measure on-disk framework usage (fast — no rglob on huge dirs)
+                disk_usage = measure_framework_disk_usage()
 
-        # Sample framework dirs (full 5s)
-        try:
-            measured_writes = sample_framework_writes(seconds=sample_seconds)
-        except Exception as e:
-            log.error("Write sample failed: %s", e)
-            measured_writes = {}
+                # 4. Get background-sampled write rates (non-blocking)
+                bg_writes = sampler.get_latest()
 
-        # Combine: focus on detected frameworks + measured dirs
-        framework_dicts = []
-        seen_labels = set()
+                # If caller asked for a live sample, run it in a thread (cap 2s to stay responsive)
+                live_writes: Dict[str, float] = {}
+                if sample_seconds > 0:
+                    sample_seconds = min(sample_seconds, 2.0)
+                    result_holder: list = [{}]
 
-        for p in ai_processes:
-            label = p.label
-            if label in seen_labels:
+                    def _bg_sample():
+                        try:
+                            result_holder[0] = sample_framework_writes(seconds=sample_seconds)
+                        except Exception as e:
+                            log.warning("Live sample failed (non-fatal): %s", e)
+
+                    t = threading.Thread(target=_bg_sample)
+                    t.start()
+                    t.join(timeout=sample_seconds + 2)
+                    live_writes = result_holder[0]
+
+        # 5. Build framework info list — merge detected processes + estimates
+        framework_infos = []
+        seen_ids = set()
+        total_daily_gb = 0.0
+
+        for proc in detected_procs:
+            tool_id = proc.name.lower().replace(" ", "_").replace("(", "").replace(")", "")
+            # Normalize common names to registry keys
+            id_map = {
+                "ollama_server": "ollama",
+                "ollama": "ollama",
+                "claude_code_(anthropic)": "claude_code",
+                "claude_code": "claude_code",
+                "openai_codex_cli": "codex",
+                "cursor_ai": "cursor",
+                "lm_studio": "lm_studio",
+                "jan_(cerebras)": "jan",
+                "chromadb": "chroma",
+                "n8n_workflow": "n8n",
+                "crewai_agent": "crewai",
+                "autogen_(microsoft)": "autogen",
+                "autogpt": "autogpt",
+                "hermes_agent_(nous)": "hermes",
+            }
+            reg_id = id_map.get(tool_id, tool_id)
+            est = estimate_for(reg_id)
+            confidence = confidence_for(reg_id)
+
+            # Use live-measured rate if available, else background, else estimate
+            measured_rate = live_writes.get(proc.label) or bg_writes.get(proc.label)
+            if measured_rate and measured_rate > 0:
+                daily_gb = round(measured_rate * 86400 / (1024**3), 2)
+                source = "live_sample"
+                confidence = "measured"
+            else:
+                daily_gb = est["gb_per_day"]
+                source = est["source"]
+
+            severity = "high" if daily_gb >= 10 else "medium" if daily_gb >= 2 else "low"
+
+            fw_info = {
+                "id": reg_id,
+                "name": proc.label,
+                "pid": proc.pid,
+                "estimated_daily_gb": daily_gb,
+                "severity": severity,
+                "confidence": confidence,
+                "source": source,
+                "measured_bytes_per_sec": measured_rate if measured_rate else None,
+                "on_disk_size_bytes": proc.on_disk_size_bytes,
+            }
+            key = (reg_id, proc.label)
+            if key not in seen_ids:
+                seen_ids.add(key)
+                framework_infos.append(fw_info)
+                total_daily_gb += daily_gb
+
+        # 6. Also add frameworks from disk_usage that weren't detected as running
+        for label, size_bytes in disk_usage.items():
+            if any(label in f["name"] for f in framework_infos):
                 continue
-            seen_labels.add(label)
+            # Normalize label to registry key
+            label_map = {
+                "Ollama models": "ollama",
+                "Claude Code projects": "claude_code",
+                "Cursor storage": "cursor",
+                "n8n logs & DB": "n8n",
+                "ChromaDB persist": "chroma",
+                "Hermes Agent": "hermes",
+                "LM Studio cache": "lm_studio",
+            }
+            reg_id = label_map.get(label, label.lower().replace(" ", "_"))
+            est = estimate_for(reg_id)
+            confidence = confidence_for(reg_id)
+            daily_gb = est["gb_per_day"]
+            severity = "high" if daily_gb >= 10 else "medium" if daily_gb >= 2 else "low"
 
-            # Pair the process with measured writes by label family substrings
-            label_key = label.split(" ")[0].lower()
-            measured_rate = 0.0
-            for ml, rate in measured_writes.items():
-                if any(word.lower() in label_key for word in ml.split()):
-                    measured_rate += rate
-                    break
-
-            daily_gb = (measured_rate * 86400) / (1024**3) if measured_rate > 0 else p.severity_gb_per_day
-
-            framework_dicts.append({
-                "id": label_key,
+            fw_info = {
+                "id": reg_id,
                 "name": label,
-                "detected_path": p.image_path,
-                "is_running": True,
-                "pid": p.pid,
-                "process_name": p.name,
-                "cmdline": p.cmdline_match or "",
-                "estimated_daily_gb": round(daily_gb, 2),
-                "measured_bytes_per_sec": round(measured_rate, 1) if measured_rate > 0 else None,
-                "severity": (
-                    "high" if daily_gb >= 10
-                    else "medium" if daily_gb >= 2
-                    else "low"
-                ),
-                "source": "process+measurement" if measured_rate > 0 else "process+estimate",
-            })
+                "pid": 0,
+                "estimated_daily_gb": daily_gb,
+                "severity": severity,
+                "confidence": confidence,
+                "source": est["source"],
+                "measured_bytes_per_sec": None,
+                "on_disk_size_bytes": size_bytes,
+            }
+            framework_infos.append(fw_info)
+            total_daily_gb += daily_gb
 
-        # Add dirs that are growing on disk even if we didn't see the process
-        for label, rate in measured_writes.items():
-            if any(label in f.get("name", "") for f in framework_dicts):
-                continue
-            label_key = label.split(" ")[0].lower()
-            daily_gb = (rate * 86400) / (1024**3)
-            if daily_gb >= 0.5:  # ignore noise <0.5GB/day
-                framework_dicts.append({
-                    "id": label_key,
-                    "name": label,
-                    "detected_path": "(sampled on disk)",
-                    "is_running": False,
-                    "pid": None,
-                    "process_name": None,
-                    "cmdline": "",
-                    "estimated_daily_gb": round(daily_gb, 2),
-                    "measured_bytes_per_sec": round(rate, 1),
-                    "severity": ("high" if daily_gb >= 10 else "medium" if daily_gb >= 2 else "low"),
-                    "source": "measurement-only",
-                })
-
-        # Disk-on-disk usage of known framework dirs (independent stat)
-        on_disk = measure_framework_disk_usage()
-
-        total_daily_gb = sum(f["estimated_daily_gb"] for f in framework_dicts)
-        if total_daily_gb > 0:
+        # 7. Calculate projected drive life
+        if drive_info.tbw_written_tb and total_daily_gb > 0:
             drive_info.projected_life_months = drive_info.estimate_life_months(total_daily_gb)
 
-        is_shield = shield_manager.is_shield_active()
-        state["shield_active"] = is_shield
+        scan_result = ScanResult(
+            drive=drive_info,
+            frameworks=framework_infos,
+            total_daily_gb=total_daily_gb,
+            shield_active=shield_manager.get_status().active,
+            scan_duration_ms=int((time.time() - start) * 1000),
+        )
 
-        result = {
-            "drive": drive_info.to_dict(),
-            "frameworks": framework_dicts,
-            "total_daily_gb": round(total_daily_gb, 3),
-            "shield_active": is_shield,
-            "scan_duration_ms": int((time.time() - start) * 1000),
-            "sample_seconds": sample_seconds,
-            "framework_disk_usage_bytes": on_disk,
-            "ai_process_count": len(ai_processes),
-            "respecting_uncertainty": True,
-        }
-        state["last_scan"] = result
-        return jsonify(result)
+        state["last_scan"] = scan_result
+        state["last_scan_time"] = time.time()
+
+        return jsonify(scan_result.to_dict())
 
     @app.route("/api/drive", methods=["GET"])
-    def api_drive():
-        try:
-            info = smart_reader.get_drive_info()
-            return jsonify(info.to_dict())
-        except Exception as e:
-            log.error("SMART read failed: %s", e)
-            return jsonify({"model": "Unavailable", "error": str(e)}), 500
+    def drive_info():
+        """Get SSD health info only."""
+        info = smart_reader.get_drive_info()
+        return jsonify(info.to_dict())
 
     @app.route("/api/frameworks", methods=["GET"])
-    def api_frameworks():
-        detected = path_scanner.scan_all()
-        return jsonify([fw.to_dict() for fw in detected])
+    def frameworks():
+        """Detect active AI frameworks only."""
+        procs = detect_ai_processes(timeout_sec=10)
+        return jsonify([p.to_dict() for p in procs])
 
-    # ─── Shield ───────────────────────────────────────────────────────
+    # ─── Shield Routes (honest, OS-verified) ───────────────────────
 
     @app.route("/api/shield/status", methods=["GET"])
     def shield_status():
-        is_active = shield_manager.is_shield_active()
-        state["shield_active"] = is_active
-        return jsonify({
-            "active": is_active,
-            "ramdisk_letter": shield_manager.get_ramdisk_letter(),
-            "redirected_paths": list(shield_manager.get_redirected_paths().keys()),
-        })
+        """Get current shield status — ALWAYS re-verified against OS."""
+        status = shield_manager.get_status()
+        state["shield_active"] = status.active
+        return jsonify(status.to_dict())
 
     @app.route("/api/shield/activate", methods=["POST"])
     def shield_activate():
+        """Activate SSD protection shield. Requires license."""
         data = request.get_json() or {}
         ramdisk_size_gb = data.get("ramdisk_size_gb", 4)
+        license_key = data.get("license_key")
 
-        try:
-            result = shield_manager.activate_shield(
-                ramdisk_size_gb=ramdisk_size_gb,
-                frameworks=state["last_scan"].get("frameworks") if state["last_scan"] else None,
-            )
-            state["shield_active"] = True
-            return jsonify({"success": True, **result})
-        except Exception as e:
-            log.error("Shield activation failed: %s", e)
-            return jsonify({"success": False, "error": str(e)}), 500
+        # Verify license
+        license_verified = False
+        if license_key:
+            lr = license_manager.activate(license_key)
+            if lr.get("state") in ("verified_fresh", "cached_valid"):
+                license_verified = True
+        else:
+            lic_status = license_manager.get_status()
+            if lic_status.get("state") in ("verified_fresh", "verification_due"):
+                license_verified = True
+
+        if not license_verified:
+            return jsonify({
+                "success": False,
+                "error": "License required",
+                "state": "needs_license",
+            }), 403
+
+        result = shield_manager.activate_shield(
+            ramdisk_size_gb=ramdisk_size_gb,
+            frameworks=state["last_scan"].frameworks if state["last_scan"] else None,
+            license_key=license_key,
+            license_verified=True,
+        )
+        state["shield_active"] = result.active
+        state["ramdisk_letter"] = result.ramdisk_letter
+        return jsonify({"success": result.active, **result.to_dict()})
 
     @app.route("/api/shield/deactivate", methods=["POST"])
     def shield_deactivate():
-        try:
-            result = shield_manager.deactivate_shield()
-            state["shield_active"] = False
-            return jsonify({"success": True, **result})
-        except Exception as e:
-            log.error("Shield deactivation failed: %s", e)
-            return jsonify({"success": False, "error": str(e)}), 500
+        """Deactivate shield and restore original paths."""
+        result = shield_manager.deactivate_shield()
+        state["shield_active"] = False
+        return jsonify(result)
 
     @app.route("/api/shield/benchmark", methods=["POST"])
     def shield_benchmark():
+        """Run write benchmark."""
         data = request.get_json() or {}
-        duration_sec = data.get("duration_sec", 60)
+        duration_sec = data.get("duration_sec", 10)
+        result = shield_manager.run_benchmark(duration_sec=duration_sec)
+        return jsonify(result)
 
-        try:
-            result = shield_manager.run_benchmark(
-                duration_sec=duration_sec,
-                frameworks=state["last_scan"].get("frameworks") if state["last_scan"] else None,
-            )
-            return jsonify({"success": True, **result})
-        except Exception as e:
-            log.error("Benchmark failed: %s", e)
-            return jsonify({"success": False, "error": str(e)}), 500
+    # ─── License Routes ─────────────────────────────────────────────
 
-    # ─── Web UI ───────────────────────────────────────────────────────
+    @app.route("/api/license/status", methods=["GET"])
+    def license_status():
+        """Get current license status."""
+        return jsonify(license_manager.get_status())
+
+    @app.route("/api/license/activate", methods=["POST"])
+    def license_activate():
+        """Activate a license key."""
+        data = request.get_json() or {}
+        key = data.get("license_key", "").strip()
+        if not key:
+            return jsonify({"state": "rejected", "error": "empty",
+                           "message": "Paste your license key."}), 400
+        result = license_manager.activate(key)
+        return jsonify(result)
+
+    @app.route("/api/license/deactivate", methods=["POST"])
+    def license_deactivate():
+        """Remove stored license."""
+        ok = license_manager.deactivate()
+        return jsonify({"success": ok})
+
+    # ─── Admin Elevation ────────────────────────────────────────────
+
+    @app.route("/api/admin/elevate", methods=["POST"])
+    def admin_elevate():
+        """Re-launch DRIVE with UAC admin elevation."""
+        pid = shield_manager.request_elevation_and_restart()
+        if pid > 0:
+            return jsonify({"success": True, "message": "Elevating. New instance will start with admin."})
+        return jsonify({"success": False, "error": "Elevation failed or cancelled by user."}), 500
+
+    # ─── Share Routes ──────────────────────────────────────────────
+
+    @app.route("/api/share/text", methods=["GET"])
+    def share_text():
+        """Get compact text report for sharing."""
+        scan = state["last_scan"]
+        if scan is None:
+            return jsonify({"text": "Run a scan first."})
+        shield = shield_manager.get_status()
+        text = build_share_report(scan.to_dict(), shield)
+        return jsonify({"text": text})
+
+    @app.route("/api/share/card.svg", methods=["GET"])
+    def share_card_svg():
+        """SVG share card."""
+        scan = state["last_scan"]
+        if scan is None:
+            return Response("<svg></svg>", mimetype="image/svg+xml")
+        shield = shield_manager.get_status()
+        svg = build_share_card_svg(scan.to_dict(), shield)
+        return Response(svg, mimetype="image/svg+xml")
+
+    @app.route("/api/share/card.png", methods=["GET"])
+    def share_card_png():
+        """PNG share card (1200x630)."""
+        scan = state["last_scan"]
+        if scan is None:
+            return Response(b"", mimetype="image/png")
+        shield = shield_manager.get_status()
+        png_bytes = build_share_card_png(scan.to_dict(), shield)
+        return Response(png_bytes, mimetype="image/png")
+
+    # ─── Config Route ──────────────────────────────────────────────
+
+    @app.route("/api/config", methods=["GET"])
+    def get_config():
+        return jsonify({
+            "smartmontools_path": config.smartmontools_path,
+            "data_dir": str(config.data_dir),
+            "version": "1.2.0",
+        })
+
+    # ─── Web UI ────────────────────────────────────────────────────
 
     @app.route("/")
     def index():
         return render_ui()
 
     return app
+
+
+# ─── Embedded Web UI ──────────────────────────────────────────────────────────
+from v2_ui import render_ui

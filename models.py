@@ -133,18 +133,8 @@ class FrameworkInfo:
         return d
 
 
-@dataclass
-class ShieldStatus:
-    """Current state of the SSD protection shield."""
-    active: bool = False
-    ramdisk_letter: Optional[str] = None
-    ramdisk_size_gb: int = 0
-    redirected_count: int = 0
-    estimated_ssd_savings_gb_per_day: float = 0.0
-    activated_at: Optional[str] = None
-
-    def to_dict(self) -> dict:
-        return asdict(self)
+# NOTE: ShieldStatus lives in shield_manager.py with full honest state machine.
+# The stub that was here has been removed to avoid confusion.
 
 
 @dataclass

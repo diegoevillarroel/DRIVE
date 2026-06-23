@@ -326,20 +326,31 @@ KNOWN_FRAMEWORK_DIRS = [
 ]
 
 
-def folder_size_bytes(path: Path) -> int:
+def folder_size_bytes(path: Path, max_depth: int = 2, max_entries: int = 5000) -> int:
+    """Count total file size under path. Bounded by depth and entry count to avoid
+    blocking on huge directories (e.g. Ollama models, AppData trees).
+    For directories with many large files (models), depth=1-2 is sufficient.
+    """
     total = 0
+    entries = 0
     try:
         for entry in path.rglob("*"):
+            entries += 1
+            if entries > max_entries:
+                # Approximate: multiply current total by estimated ratio
+                # (total / entries * remaining) but just stop and report what we have
+                break
             try:
-                is_file = entry.is_file()
+                depth = len(entry.relative_to(path).parts)
+            except ValueError:
+                continue
+            if depth > max_depth:
+                continue
+            try:
+                if entry.is_file():
+                    total += entry.stat().st_size
             except (OSError, PermissionError):
                 continue
-            if is_file:
-                try:
-                    size = entry.stat().st_size
-                except (OSError, PermissionError):
-                    continue
-                total += size
     except (OSError, PermissionError):
         pass
     return total
@@ -357,7 +368,8 @@ def expand_env(s: str) -> Optional[Path]:
 
 
 def measure_framework_disk_usage() -> dict:
-    """Returns {label: bytes_used} for known framework data dirs."""
+    """Returns {label: bytes_used} for known framework data dirs.
+    Uses max_depth=1 for speed: model dirs and cache dirs have large files at top level."""
     out = {}
     for label, paths in KNOWN_FRAMEWORK_DIRS:
         total = 0
@@ -365,7 +377,7 @@ def measure_framework_disk_usage() -> dict:
             p = expand_env(raw)
             if p is None:
                 continue
-            total += folder_size_bytes(p)
+            total += folder_size_bytes(p, max_depth=1, max_entries=2000)
         if total > 0:
             out[label] = total
     return out
@@ -402,7 +414,7 @@ def sample_framework_writes(seconds: float = 5.0, candidates: Optional[List[str]
     snap0 = {}
     for label, p in candidates:
         try:
-            snap0[(label, p)] = folder_size_bytes(Path(p))
+            snap0[(label, p)] = folder_size_bytes(Path(p), max_depth=1, max_entries=2000)
         except OSError:
             snap0[(label, p)] = 0
 
@@ -412,7 +424,7 @@ def sample_framework_writes(seconds: float = 5.0, candidates: Optional[List[str]
     snap1 = {}
     for label, p in candidates:
         try:
-            snap1[(label, p)] = folder_size_bytes(Path(p))
+            snap1[(label, p)] = folder_size_bytes(Path(p), max_depth=1, max_entries=2000)
         except OSError:
             snap1[(label, p)] = snap0.get((label, p), 0)
 
