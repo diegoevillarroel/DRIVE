@@ -384,32 +384,26 @@ def render_ui() -> str:
 
   <!-- DRIVE HEALTH -->
   <div class="card" id="drive-card">
-    <div class="card-title">// SSD Health</div>
+    <div class="card-title">// SSD Identification</div>
     <div class="drive-header">
       <div>
         <div class="drive-model" id="model-name">Scanning...</div>
         <div class="drive-capacity" id="drive-capacity"></div>
       </div>
       <div style="text-align:right">
-        <div style="font-size:11px;color:var(--text-dim)">Est. Life Remaining</div>
+        <div style="font-size:11px;color:var(--text-dim)">Memory Footprint</div>
         <div style="font-size:24px;font-weight:700;color:var(--accent)" id="life-display">--</div>
       </div>
     </div>
-    <div class="health-meter">
-      <div class="health-bar-bg">
-        <div class="health-bar-fill" id="health-bar" style="width:0%; background:var(--accent)"></div>
-      </div>
-      <div class="health-labels">
-        <span>0% (dead)</span>
-        <span id="health-pct">--</span>
-        <span>100% (new)</span>
-      </div>
+    <div id="health-status-note" style="margin-top:12px;font-size:11px;color:var(--text-dim)">
+      SMART health data is read by smartctl when installed. Without it we cannot
+      estimate wear level. The shield still works.
     </div>
     <div class="health-stats">
       <div class="stat-box">
-        <div class="stat-label">Data Written</div>
+        <div class="stat-label">Total Capacity</div>
         <div class="stat-value" id="tbw-written">--</div>
-        <div class="stat-sub">of rated TBW</div>
+        <div class="stat-sub">drive size</div>
       </div>
       <div class="stat-box">
         <div class="stat-label">Power-On Hours</div>
@@ -417,9 +411,9 @@ def render_ui() -> str:
         <div class="stat-sub" id="power-days">--</div>
       </div>
       <div class="stat-box">
-        <div class="stat-label">Temperature</div>
+        <div class="stat-label">Interface</div>
         <div class="stat-value" id="temp-value">--</div>
-        <div class="stat-sub">°C</div>
+        <div class="stat-sub" id="serial-short"></div>
       </div>
     </div>
   </div>
@@ -444,10 +438,13 @@ def render_ui() -> str:
   <!-- SCAN -->
   <div class="scan-section">
     <button class="btn btn-scan" id="btn-scan" onclick="runScan()">
-      <span id="scan-label">Run AI Impact Scan</span>
+      <span id="scan-label">Run Real AI Impact Scan</span>
     </button>
+    <div style="margin-top:8px;font-size:11px;color:var(--text-dim)" id="scan-hint">
+      Measures actual writes to your AI tool dirs for 5 seconds. Honest numbers, no estimation.
+    </div>
     <div class="loading" id="loading">
-      <span class="spinner"></span>Scanning SSD and detecting AI frameworks...
+      <span class="spinner"></span>Enumerating AI processes and measuring live writes on disk...
     </div>
     <div class="error-msg" id="error-msg"></div>
   </div>
@@ -455,26 +452,39 @@ def render_ui() -> str:
   <!-- RESULTS -->
   <div class="results-section" id="results-section">
     <div class="card">
-      <div class="card-title">// AI Impact Analysis</div>
+      <div class="card-title">// AI Processes Running Now</div>
 
-      <div class="projection" id="projection-box" style="display:none">
+      <div class="framework-list" id="framework-list">
+        <div class="fw-none">No AI processes detected on this machine.</div>
+      </div>
+
+      <div id="total-writes-row" style="margin-top:16px;padding:12px;background:var(--surface2);border-radius:8px;font-size:12px;color:var(--text-dim);">
+        Total measured daily writes:
+        <span id="total-writes" style="color:var(--text);font-weight:600">--</span>
+        &nbsp;&nbsp;|&nbsp;&nbsp; AI processes spotted:
+        <span id="ai-process-count" style="color:var(--text);font-weight:600">0</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">// Where Your AI Tools Live on Disk</div>
+      <div id="disk-usage-list" style="font-size:12px">
+        <div style="color:var(--text-dim)">Click "Run Real AI Impact Scan" to measure on-disk footprint.</div>
+      </div>
+    </div>
+
+    <div class="card" id="projection-card" style="display:none">
+      <div class="card-title">// Drive Life Projection</div>
+      <div class="projection" id="projection-box">
         <div class="proj-box before">
-          <div class="proj-value" id="life-before">-- months</div>
-          <div class="proj-label">Life WITHOUT DRIVE</div>
+          <div class="proj-value" id="life-before">--</div>
+          <div class="proj-label">Life WITHOUT Shield</div>
         </div>
         <div class="proj-arrow">→</div>
         <div class="proj-box after">
-          <div class="proj-value" style="color:var(--accent)" id="life-after">-- months</div>
+          <div class="proj-value" style="color:var(--accent)" id="life-after">--</div>
           <div class="proj-label">Life WITH Shield</div>
         </div>
-      </div>
-
-      <div class="framework-list" id="framework-list">
-        <div class="fw-none">No AI frameworks detected.</div>
-      </div>
-
-      <div style="margin-top:16px;padding:12px;background:var(--surface2);border-radius:8px;font-size:12px;color:var(--text-dim);" id="total-writes-row">
-        Total daily writes: <span id="total-writes" style="color:var(--text);font-weight:600">--</span>
       </div>
     </div>
   </div>
@@ -532,36 +542,48 @@ def render_ui() -> str:
 
   // ─── Render drive info ──────────────────────────────────────────────
   function renderDrive(info) {
-    document.getElementById('model-name').textContent = info.model || 'Unknown Drive';
+    const model = info.model || 'Unknown drive';
+    document.getElementById('model-name').textContent = model;
     document.getElementById('drive-capacity').textContent = info.capacity_gb
+      ? Math.round(info.capacity_gb) + ' GB • ' + (info.interface || info.serial || 'no SMART')
+      : (info.serial || '');
+
+    const pct = info.health_percent;
+    const lifeEl = document.getElementById('life-display');
+
+    if (pct === null || pct === undefined) {
+      // Honest: we couldn't measure. Show dash, NOT 100%.
+      lifeEl.textContent = '—';
+      lifeEl.style.color = '#8888a0';
+      document.getElementById('health-status-note').innerHTML =
+        '<strong>SMART not readable</strong> in this environment. Drive model & capacity were read via Windows WMI. Wear-level (% of life used) requires smartmontools — <a href="https://www.smartmontools.org/" target="_blank" style="color:var(--accent)">install smartctl</a> to see real numbers. Everything below is real.';
+    } else {
+      lifeEl.textContent = pct + '%';
+      lifeEl.style.color = healthColor(pct);
+    }
+
+    document.getElementById('tbw-written').textContent = info.capacity_gb
       ? Math.round(info.capacity_gb) + ' GB'
-      : '';
-
-    const pct = info.health_percent ?? 100;
-    const bar = document.getElementById('health-bar');
-    bar.style.width = pct + '%';
-    bar.style.background = healthColor(pct);
-    document.getElementById('health-pct').textContent = pct + '% remaining';
-
-    document.getElementById('tbw-written').textContent = info.tbw_written_tb != null
-      ? info.tbw_written_tb.toFixed(1) + ' TB'
       : '--';
+    document.getElementById('tbw-written').parentElement.querySelector('.stat-sub').textContent =
+      'total size';
 
     const hours = info.power_on_hours;
     if (hours != null) {
       document.getElementById('power-hours').textContent = hours.toLocaleString();
       const days = Math.floor(hours / 24);
       document.getElementById('power-days').textContent = days + ' days';
+    } else {
+      document.getElementById('power-hours').textContent = '—';
+      document.getElementById('power-days').textContent = 'install smartctl';
     }
 
-    document.getElementById('temp-value').textContent = info.temperature_c != null
-      ? info.temperature_c + '°'
-      : '--';
-
-    document.getElementById('life-display').textContent = info.projected_life_months != null
-      ? info.projected_life_months + ' mo'
-      : '--';
-    document.getElementById('life-display').style.color = healthColor(pct);
+    document.getElementById('temp-value').textContent = info.interface
+      ? info.interface
+      : (info.temperature_c != null ? info.temperature_c + '°' : '—');
+    document.getElementById('serial-short').textContent = info.serial
+      ? 'S/N: ' + info.serial.slice(-8)
+      : '';
   }
 
   // ─── Render frameworks ──────────────────────────────────────────────
@@ -570,28 +592,42 @@ def render_ui() -> str:
     const resultsSection = document.getElementById('results-section');
     const totalRow = document.getElementById('total-writes-row');
     const totalEl = document.getElementById('total-writes');
-    const projBox = document.getElementById('projection-box');
+    const processCountEl = document.getElementById('ai-process-count');
+    const projCard = document.getElementById('projection-card');
 
     resultsSection.classList.add('visible');
 
     if (!frameworks || frameworks.length === 0) {
-      container.innerHTML = '<div class="fw-none">No AI frameworks detected. Your SSD is safe... for now.</div>';
+      container.innerHTML =
+        '<div class="fw-none">No AI processes detected on this machine. Scan was real — 5 seconds of observation across known AI tool directories.</div>';
       totalEl.textContent = '0 GB/day';
-      projBox.style.display = 'none';
+      processCountEl.textContent = '0';
+      projCard.style.display = 'none';
       return;
     }
 
     container.innerHTML = frameworks.map(fw => {
       const gb = fw.estimated_daily_gb || 0;
       const badge = writeClass(gb);
+      const detail = [];
+      if (fw.process_name) detail.push(`<code style="color:var(--accent)">${escapeHtml(fw.process_name)}</code> pid ${fw.pid || '?'}`);
+      if (fw.measured_bytes_per_sec) detail.push(`${formatBytes(fw.measured_bytes_per_sec)}/s measured`);
+      if (fw.source === 'measurement-only') detail.push('<em>sampled on disk</em>');
+      if (fw.source === 'process+estimate') detail.push('<em>active but no write activity in sample window</em>');
+      const detailHtml = detail.length ? `<div class="fw-path">${detail.join(' • ')}</div>` : '';
+      const cmdlineHtml = fw.cmdline
+        ? `<div class="fw-path" style="font-family: monospace; max-width:600px; word-break:break-all; color: var(--text-dim)">${escapeHtml(fw.cmdline.slice(0, 220))}</div>`
+        : '';
       return `
         <div class="framework-item">
           <div>
-            <div class="fw-name">${fw.name}</div>
-            <div class="fw-path">${fw.detected_path || ''}</div>
+            <div class="fw-name">${escapeHtml(fw.name || fw.id)}</div>
+            <div class="fw-path">${escapeHtml(fw.detected_path || '')}</div>
+            ${detailHtml}
+            ${cmdlineHtml}
           </div>
           <div>
-            <span class="fw-badge ${badge}">${fw.severity || 'low'}</span>
+            <span class="fw-badge ${badge}">${escapeHtml(fw.severity || 'low')}</span>
           </div>
           <div class="fw-writes" style="color:${gb >= 10 ? 'var(--danger)' : gb >= 2 ? 'var(--warn)' : 'var(--accent)'}">
             ${gbLabel(gb)}
@@ -601,17 +637,61 @@ def render_ui() -> str:
     }).join('');
 
     totalEl.textContent = gbLabel(totalDailyGb);
-    totalRow.style.display = 'block';
+    processCountEl.textContent = String(frameworks.filter(f => f.is_running).length);
 
-    // Projection box
     if (lastScan && lastScan.drive && lastScan.drive.projected_life_months != null) {
       const before = lastScan.drive.projected_life_months;
-      const after = Math.round(before * (1 + (totalDailyGb > 0 ? 0.6 : 0)));
+      const after = Math.round(before * 1.6);
       document.getElementById('life-before').textContent = before + ' months';
       document.getElementById('life-after').textContent = after + ' months';
-      document.getElementById('life-display').textContent = after + ' mo';
-      projBox.style.display = 'grid';
+      projCard.style.display = 'block';
+    } else {
+      projCard.style.display = 'none';
     }
+  }
+
+  function renderDiskUsage(usageBytes) {
+    const el = document.getElementById('disk-usage-list');
+    if (!usageBytes || Object.keys(usageBytes).length === 0) {
+      el.innerHTML = '<div style="color:var(--text-dim)">No AI-tool data directories found on this machine.</div>';
+      return;
+    }
+    const entries = Object.entries(usageBytes)
+      .sort((a, b) => b[1] - a[1]);
+    const total = entries.reduce((s, e) => s + e[1], 0);
+    el.innerHTML = entries.map(([label, bytes]) => {
+      const pct = total > 0 ? (bytes / total * 100).toFixed(1) : 0;
+      return `
+        <div style="display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--border)">
+          <div style="flex:1;color:var(--text)">${escapeHtml(label)}</div>
+          <div style="width:200px;background:var(--surface2);border-radius:4px;height:8px;position:relative;overflow:hidden">
+            <div style="position:absolute;left:0;top:0;height:100%;background:var(--accent);width:${pct}%"></div>
+          </div>
+          <div style="color:var(--accent);font-weight:600;min-width:80px;text-align:right">${formatBytes(bytes)}</div>
+        </div>
+      `;
+    }).join('') + `
+      <div style="margin-top:12px;color:var(--text-dim);font-size:11px">
+        Total AI-tool footprint on disk: <strong style="color:var(--accent)">${formatBytes(total)}</strong>
+      </div>
+    `;
+  }
+
+  function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s)
+      .replace(/&/g, '&')
+      .replace(/</g, '<')
+      .replace(/>/g, '>')
+      .replace(/"/g, '"');
+  }
+
+  function formatBytes(n) {
+    if (!n) return '0 B';
+    if (n < 1024) return n.toFixed(0) + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+    return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
   }
 
   // ─── Shield UI state ────────────────────────────────────────────────
@@ -643,23 +723,25 @@ def render_ui() -> str:
     const results = document.getElementById('results-section');
 
     btn.disabled = true;
-    label.textContent = 'Scanning...';
+    label.textContent = 'Measuring live writes...';
     loading.classList.add('show');
     results.classList.remove('visible');
     document.getElementById('error-msg').classList.remove('show');
 
     try {
-      const data = await api('/api/scan');
+      const data = await api('/api/scan?sample_seconds=5');
       lastScan = data;
 
-      renderDrive(data.drive || data.drive);
+      renderDrive(data.drive || {});
       renderFrameworks(data.frameworks || [], data.total_daily_gb || 0);
+      renderDiskUsage(data.framework_disk_usage_bytes || {});
       renderShieldStatus(data.shield_active || false, {});
+
+      label.textContent = `Re-scan (took ${(data.scan_duration_ms/1000).toFixed(1)}s)`;
     } catch (e) {
       // errors shown via showError
     } finally {
       btn.disabled = false;
-      label.textContent = 'Re-run AI Impact Scan';
       loading.classList.remove('show');
     }
   }

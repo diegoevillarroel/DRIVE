@@ -99,120 +99,116 @@ class SmartReader:
 
     def get_drive_info(self, device: Optional[str] = None) -> DriveInfo:
         """
-        Read SMART data for a specific device or the first available drive.
-        Returns DriveInfo with all available health metrics.
-        """
-        if device is None:
-            # Find first available device
-            drives = self.get_drives()
-            if drives:
-                device = drives[0].get("name") or drives[0].get("info", {}).get("name")
-            if not device:
-                log.warning("No drives detected — returning empty DriveInfo")
-                return DriveInfo(model="No drive detected")
+        Read SMART data for the primary drive.
 
+        Strategy (in order):
+        1. smartctl JSON (when installed) — best path
+        2. WMI Win32_DiskDrive for model/serial/capacity (always works)
+        3. Honest 'could not read SMART' — never returns fake 100% health
+        """
         info = DriveInfo()
 
-        try:
-            # NVMe path
-            data = self._run_smartctl(["-j", "-a", device])
+        # 1. Try smartctl first
+        smart_data: dict = {}
+        if self.smartctl_path:
+            target = device
+            try:
+                if target is None:
+                    drives = self.get_drives()
+                    if drives:
+                        target = drives[0].get("name") or drives[0].get("info", {}).get("name")
+                if target:
+                    smart_data = self._run_smartctl(["-j", "-a", target])
+            except Exception as e:
+                log.debug("smartctl call failed: %s", e)
+                smart_data = {}
 
-            if "nvme_smart_health_information_log" in data:
-                nvme = data["nvme_smart_health_information_log"]
-                info.temperature_c = nvme.get("temperature")
-                info.power_on_hours = nvme.get("power_on_hours")
-                info.power_cycles = nvme.get("power_cycles")
-
-                # NVMe bytes written — convert to TB
-                bytes_written = nvme.get("data_units_written", 0)
-                if isinstance(bytes_written, list) and len(bytes_written) >= 2:
-                    bytes_written = bytes_written[0]  # First value
-                info.tbw_written_tb = round(bytes_written * 512 / 1_000_000, 3)
-
-                spare = nvme.get("available_spare")
-                if spare is not None:
-                    info.spare_remaining_pct = int(spare)
-                    info.health_percent = int(spare)
-
-                info.interface = "NVMe"
-
-            # ATA/SATA path
-            if "ata_smart_attributes" in data:
-                ata = data["ata_smart_attributes"]
-                info.model = ata.get("model", info.model)
-                info.serial = ata.get("serial", info.serial)
-                info.firmware = ata.get("firmware", info.firmware)
-
-                # Parse SMART attributes table
-                table = ata.get("table", [])
-                for attr in table:
-                    id_num = attr.get("id")
-                    name = attr.get("name", "").lower()
-                    value = attr.get("value")
-                    worst = attr.get("worst")
-                    thresh = attr.get("thresh")
-                    raw = attr.get("raw", {}).get("string", "").strip()
-
-                    if id_num == 9:   # Power-On Hours
-                        info.power_on_hours = int(raw) if raw.isdigit() else value
-                    elif id_num == 12:  # Power Cycle Count
-                        info.power_cycles = int(raw) if raw.isdigit() else value
-                    elif id_num == 177:  # Wear Leveling Count (SSD)
+        # NVMe fields
+        if "nvme_smart_health_information_log" in smart_data:
+            nvme = smart_data["nvme_smart_health_information_log"]
+            info.temperature_c = nvme.get("temperature")
+            info.power_on_hours = nvme.get("power_on_hours")
+            info.power_cycles = nvme.get("power_cycles")
+            bw = nvme.get("data_units_written", 0)
+            if isinstance(bw, list) and len(bw) >= 2:
+                bw = bw[0]
+            info.tbw_written_tb = round(bw * 512 / 1_000_000, 3)
+            spare = nvme.get("available_spare")
+            if spare is not None:
+                info.spare_remaining_pct = int(spare)
+                info.health_percent = int(spare)
+            info.interface = "NVMe"
+        # ATA/SATA fields
+        if "ata_smart_attributes" in smart_data:
+            ata = smart_data["ata_smart_attributes"]
+            info.model = ata.get("model", info.model)
+            info.serial = ata.get("serial", info.serial)
+            info.firmware = ata.get("firmware", info.firmware)
+            for attr in ata.get("table", []):
+                id_num = attr.get("id")
+                value = attr.get("value")
+                thresh = attr.get("thresh")
+                raw = (attr.get("raw", {}) or {}).get("string", "").strip()
+                if id_num == 9:
+                    info.power_on_hours = int(raw) if raw.isdigit() else value
+                elif id_num == 177:
+                    if value and thresh and thresh > 0:
+                        info.health_percent = int((value / thresh) * 100)
                         info.wear_leveling = value
-                        if value and thresh and thresh > 0:
-                            info.health_percent = int((value / thresh) * 100)
-                    elif id_num == 232:  # Endurance Remaining (Intel)
-                        info.health_percent = value
-                    elif id_num == 233:  # Media Wear Remaining (Samsung)
-                        info.health_percent = value
-                    elif id_num == 241:  # Total LBAs Written (Western Digital)
-                        if raw:
-                            try:
-                                parts = raw.split()
-                                val = int(parts[0], 16) if parts else 0
-                                info.tbw_written_tb = round(val * 512 / 1e12, 3)
-                            except Exception:
-                                pass
-                    elif id_num == 242:  # Total LBAs Read
-                        pass  # Not TBW but useful for completeness
+                elif id_num == 232 or id_num == 233:
+                    info.health_percent = value
+                elif id_num == 241:
+                    if raw:
+                        try:
+                            parts = raw.split()
+                            val = int(parts[0], 16) if parts else 0
+                            info.tbw_written_tb = round(val * 512 / 1e12, 3)
+                        except Exception:
+                            pass
+            info.interface = "SATA"
+        if "device" in smart_data:
+            d = smart_data.get("device", {})
+            info.model = d.get("name") or info.model
+            info.serial = d.get("serial") or info.serial
+        if "model_name" in smart_data:
+            info.model = smart_data["model_name"]
+        if "serial_number" in smart_data:
+            info.serial = smart_data["serial_number"]
+        if "user_capacity" in smart_data:
+            cap = smart_data["user_capacity"]
+            if isinstance(cap, dict):
+                info.capacity_gb = round(cap.get("bytes", 0) / 1e9, 1)
+            elif isinstance(cap, list) and len(cap) >= 2:
+                info.capacity_gb = round(cap[0] / 1e9, 1)
 
-                info.interface = "SATA"
-
-            # Common fields from info section
-            if "device" in data:
-                dev_info = data.get("device", {})
-                info.model = dev_info.get("name") or info.model
-                info.serial = dev_info.get("serial") or info.serial
-
-            if "model_name" in data:
-                info.model = data["model_name"]
-            if "serial_number" in data:
-                info.serial = data["serial_number"]
-            if "user_capacity" in data:
-                cap = data["user_capacity"]
-                if isinstance(cap, dict):
-                    info.capacity_gb = round(cap.get("bytes", 0) / 1e9, 1)
-                elif isinstance(cap, list) and len(cap) >= 2:
-                    info.capacity_gb = round(cap[0] / 1e9, 1)
-
-            # Fallback: parse from model name
+        # 2. Always ALSO try WMI Win32_DiskDrive (most reliable)
+        try:
+            from process_inspector import expand_env
+            import subprocess, json as jsonmod
+            ps = ("Get-CimInstance Win32_DiskDrive | Select-Object Model,SerialNumber,Firmware,Size,Status"
+                  " | Select-Object -First 1 | ConvertTo-Json -Compress")
+            r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                               capture_output=True, text=True, timeout=10)
+            d = jsonmod.loads(r.stdout) if r.stdout.strip() else {}
             if not info.model:
-                info.model = device
-
-            # If we still have no health estimate, estimate from TBW
-            if info.health_percent is None and info.tbw_written_tb is not None:
-                # Assume typical consumer SSD: 600 TBW rated
-                rated = 600.0
-                info.tbw_rated_tb = rated
-                info.health_percent = round(
-                    max(0, min(100, (1 - info.tbw_written_tb / rated) * 100)), 1
-                )
-
+                info.model = d.get("Model")
+            if not info.serial:
+                info.serial = d.get("SerialNumber")
+            if not info.firmware:
+                info.firmware = d.get("Firmware")
+            if not info.capacity_gb and d.get("Size"):
+                info.capacity_gb = round(int(d["Size"]) / 1e9, 1)
         except Exception as e:
-            log.error("Failed to read SMART data: %s", e)
-            # Return what we have
-            if not info.model:
-                info.model = device or "Unknown"
+            log.debug("WMI fallback failed: %s", e)
+
+        # 3. Annotate honesty
+        if info.model is None:
+            info.model = "Could not read drive"
+        if info.health_percent is None:
+            info.health_percent = None  # explicit; UI shows "— not measured"
+        if info.tbw_written_tb is not None and info.tbw_rated_tb is None:
+            info.tbw_rated_tb = 600.0
+            # Don't fake health_percent from TBW — too imprecise
 
         return info
 
